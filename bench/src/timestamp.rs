@@ -17,6 +17,7 @@ pub(super) fn define(c: &mut Criterion) {
     from_seconds(c);
     every_hour_in_week(c);
     to_civil_datetime_offset_conversion(c);
+    to_civil_datetime_offset_conversion_random(c);
     to_civil_datetime_offset_holistic(c);
     to_civil_datetime_static(c);
 }
@@ -325,6 +326,177 @@ fn to_civil_datetime_offset_conversion(c: &mut Criterion) {
             })
         });
     }
+}
+
+/// Like `to_civil_datetime_offset_conversion`, but over a batch of random
+/// timestamps within 30 years of 1970, in a few different shapes.
+fn to_civil_datetime_offset_conversion_random(c: &mut Criterion) {
+    const OFFSET: Offset = Offset::constant(-4);
+    const COUNT: usize = 65536;
+    const NAME: &str = "timestamp/to_civil_datetime_offset_conversion_random";
+
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/uniform"),
+        OFFSET,
+        COUNT,
+        RandomKind::Uniform,
+    );
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/secs-zero"),
+        OFFSET,
+        COUNT,
+        RandomKind::SecondsZero,
+    );
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/zero-min-secs"),
+        OFFSET,
+        COUNT,
+        RandomKind::ZeroMinuteSecond,
+    );
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/all-same"),
+        OFFSET,
+        COUNT,
+        RandomKind::AllSame,
+    );
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/split"),
+        OFFSET,
+        COUNT,
+        RandomKind::Split,
+    );
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/subsec1970"),
+        OFFSET,
+        COUNT,
+        RandomKind::Subsec1970,
+    );
+    random_offset_conversion_benchmark(
+        c,
+        format!("{NAME}/subsec2000"),
+        OFFSET,
+        COUNT,
+        RandomKind::Subsec2000,
+    );
+}
+
+fn random_offset_conversion_benchmark(
+    c: &mut Criterion,
+    name: String,
+    offset: Offset,
+    count: usize,
+    kind: RandomKind,
+) {
+    let timestamps = random_timestamps(count, kind);
+
+    {
+        benchmark(c, format!("{name}/jiff"), |b| {
+            b.iter(|| {
+                for &stamp in bb(&timestamps) {
+                    let dt = bb(offset).to_datetime(stamp);
+                    bb(dt);
+                }
+            })
+        });
+    }
+}
+
+/// Nanosecond component is always 0.
+#[derive(Clone, Copy)]
+enum RandomKind {
+    /// Uniformly random.
+    Uniform,
+    /// Uniformly random, second component always 0.
+    SecondsZero,
+    /// Random date and hour, minute and second always 0.
+    ZeroMinuteSecond,
+    /// Always `1719755160` (2024-06-30T09:46:00Z).
+    AllSame,
+    /// Half `Uniform`, half `ZeroMinuteSecond`, shuffled together.
+    Split,
+    /// Uniformly random around 1970, with a millisecond-granularity subsec.
+    Subsec1970,
+    /// Uniformly random around 2000, with a millisecond-granularity subsec.
+    Subsec2000,
+}
+
+/// Random timestamps within 30 years of 1970 (or 2000, for the `Subsec2000`
+/// kind), shaped according to `kind`.
+fn random_timestamps(count: usize, kind: RandomKind) -> Vec<Timestamp> {
+    let bound = |year| {
+        civil::date(year, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(TimeZone::UTC)
+            .unwrap()
+            .timestamp()
+            .as_second()
+    };
+    let center = if let RandomKind::Subsec2000 = kind { 2000 } else { 1970 };
+    let start = bound(center - 30);
+    let end = bound(center + 30);
+    let span = (end - start) as u64;
+
+    let mut state = kind as u64;
+
+    let zero_minute_second = |secs: i64| {
+        let dt = Offset::UTC.to_datetime(Timestamp::new(secs, 0).unwrap());
+        let dt = dt.date().at(dt.hour(), 0, 0, 0);
+        Offset::UTC.to_timestamp(dt).unwrap()
+    };
+
+    if let RandomKind::Split = kind {
+        let half = count / 2;
+        let mut timestamps: Vec<Timestamp> = Vec::with_capacity(count);
+        for _ in 0..half {
+            let secs = start + (splitmix64(&mut state) % span) as i64;
+            timestamps.push(Timestamp::new(secs, 0).unwrap());
+        }
+        for _ in half..count {
+            let secs = start + (splitmix64(&mut state) % span) as i64;
+            timestamps.push(zero_minute_second(secs));
+        }
+        // Fisher-Yates shuffle.
+        for i in (1..timestamps.len()).rev() {
+            let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+            timestamps.swap(i, j);
+        }
+        return timestamps;
+    }
+
+    (0..count)
+        .map(|_| {
+            let secs = start + (splitmix64(&mut state) % span) as i64;
+            match kind {
+                RandomKind::Uniform => Timestamp::new(secs, 0).unwrap(),
+                RandomKind::SecondsZero => {
+                    let secs = secs - secs.rem_euclid(60);
+                    Timestamp::new(secs, 0).unwrap()
+                }
+                RandomKind::ZeroMinuteSecond => zero_minute_second(secs),
+                RandomKind::AllSame => Timestamp::constant(1719755160, 0),
+                RandomKind::Subsec1970 | RandomKind::Subsec2000 => {
+                    let ms = (splitmix64(&mut state) % 1000) as i32;
+                    Timestamp::new(secs, ms * 1_000_000).unwrap()
+                }
+                RandomKind::Split => unreachable!(),
+            }
+        })
+        .collect()
+}
+
+/// splitmix64 PRNG.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }
 
 /// Like instant_to_civil_datetime_offset_only_conversion, but also includes
