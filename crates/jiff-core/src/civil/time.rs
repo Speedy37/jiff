@@ -144,7 +144,9 @@ impl Time {
         self,
         subsec_nanosecond: i32,
     ) -> Time {
-        debug_assert!(0 <= subsec_nanosecond && subsec_nanosecond < 1_000_000_000);
+        debug_assert!(
+            0 <= subsec_nanosecond && subsec_nanosecond < 1_000_000_000
+        );
         Time { subsec_nanosecond, ..self }
     }
 

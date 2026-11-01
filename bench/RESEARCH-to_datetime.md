@@ -35,8 +35,9 @@ One session, AMD Ryzen 9 5950X (~4.8 GHz), pinned to one core, ns per conversion
 | subsec1970    |               5.90 |            4.66 |           10.15 |         9.37 |
 | subsec2000    |               5.81 |            4.74 |           10.25 |         9.38 |
 
-Best is 14–21% faster in throughput and 5–10% in latency. In the original
-per-element loop (`/jiff`) the gain is 2–7%.
+Best is 14–21% faster than #640 in throughput and 5–10% in latency. In the
+original per-element loop (`/jiff`) the gain is 2–7%. Against current `master`
+the gain is much smaller on typical inputs (see "Against current `master`").
 
 ## Benchmark loops
 
@@ -56,6 +57,7 @@ per-element loop (`/jiff`) the gain is 2–7%.
 |------|--------|
 | `jiff_date="neri"` | `UnixEpochDay::to_date`: Neri–Schneider (the original) |
 | `jiff_date="fast128"` | fast-date-64 as published (64×64→128 multiplies) |
+| `jiff_date="fast128arm"` | fast-date-64's ARM64 variant (`SCALE = 1`): 16-bit year-part constants, January/February fixed from the month. Not benchmarked: no ARM64 machine was available |
 | *(no `jiff_date`)* | fast-date-64 with a 32-era shift: every product fits `u64`, every constant 31 bits (`imul` with immediates) |
 | `jiff_time="consroe"` | `TimeSecond::to_time`: one 64×64→128 multiply yields hour and the low bits of total minutes |
 | *(no `jiff_time`)* | `TimeSecond::to_time`: two `imul`s (#640's V3) |
@@ -110,9 +112,39 @@ include `--cfg jiff_div128` to reproduce what was measured.
 | **best** | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | E | **4.72** | **9.43** |
 | best, unchecked | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | F | 4.67 | 9.39 |
 | best, checked | `--cfg jiff_date="fast128" --cfg jiff_time="consroe" --cfg jiff_checked` | F | 4.76 | 9.63 |
+| `master` (`9ea4c2b`) | none: build upstream `master` with this branch's `bench/src/timestamp.rs` | G | 4.82 | 9.74 |
+| PR #640 | `--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_checked --cfg jiff_div128` | G | 5.68 | 10.02 |
+| best | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | G | 4.64 | 9.39 |
 
 Session D was noisier than the others (about ±8% between input kinds of the
 same build), so its fused rows are only roughly comparable with C.
+
+## Against current `master`
+
+Session G: upstream `master` (`9ea4c2b`, without #640) built in a separate
+worktree with this branch's `bench/src/timestamp.rs`, then PR #640 and best
+from this branch, one after another on the same core. ns per conversion:
+
+| input | throughput master | PR #640 | best | best vs master | latency master | PR #640 | best | best vs master |
+|-------|------:|------:|------:|------:|------:|------:|------:|------:|
+| uniform | 4.82 | 5.68 | 4.64 | -4% | 9.74 | 10.02 | 9.39 | -4% |
+| secs-zero | 4.86 | 5.71 | 4.72 | -3% | 9.91 | 10.03 | 9.32 | -6% |
+| zero-min-secs | 4.35 | 5.69 | 4.63 | +7% | 9.48 | 10.04 | 9.30 | -2% |
+| all-same | 4.82 | 5.73 | 4.65 | -3% | 9.84 | 10.04 | 9.44 | -4% |
+| split | 7.28 | 5.74 | 4.64 | -36% | 12.22 | 10.09 | 9.13 | -25% |
+| subsec1970 | 5.71 | 5.80 | 4.62 | -19% | 11.34 | 10.26 | 9.51 | -16% |
+| subsec2000 | 4.80 | 5.71 | 4.58 | -4% | 9.81 | 10.01 | 9.14 | -7% |
+
+- #640 on its own is slower than `master` in throughput on typical inputs
+  (5.68 vs 4.82 ns on `uniform`) and about even in latency. It only wins where
+  `master`'s branches mispredict: `split` and `subsec1970`.
+- Best against `master`: 3–4% faster in throughput and 2–7% in latency on
+  typical inputs, 36% / 25% faster on `split` and 19% / 16% on `subsec1970`,
+  but 7% slower in throughput on `zero-min-secs`, where `master`'s
+  on-the-hour early exit in `to_time` is perfectly predicted.
+- So most of the "best vs #640" gain recovers what #640's branch-free code
+  cost on typical inputs; the gain over `master` is small except on inputs
+  that defeat `master`'s branches.
 
 ## Findings
 
@@ -120,6 +152,9 @@ same build), so its fused rows are only roughly comparable with C.
   instruction count matters more than the number of multiplies. On this CPU
   `imul r64` is 1/cycle with latency 3 and the 128-bit `mul` about 1.25 cycles
   with latency 3 (low) or 4 (high), so 128-bit multiplies are nearly free.
+- fast-date-64's ARM64 variant (`fast128arm`) compiles on `aarch64` (with
+  Consroe time) to 80 instructions against 82 for the x86 form: only 2 fewer
+  `mov`/`movk` constant loads, same 8 multiplies. Unmeasured on ARM64.
 - fast-date-64 beats Neri–Schneider on throughput; the 32-era `imul`-only form
   does not beat the published 128-bit form.
 - Consroe's time-of-day beats #640's two-`imul` V3 with every date algorithm.
@@ -142,6 +177,9 @@ same build), so its fused rows are only roughly comparable with C.
 
 - `unix_epoch_day_to_date_exhaustive`: every valid `UnixEpochDay` against
   Neri–Schneider (whichever `jiff_date` is selected).
+- `unix_epoch_day_to_date_variants_exhaustive`: every date variant
+  (`fast128`, `fast128_arm`, `fast64`) against Neri–Schneider on every valid
+  day, regardless of `jiff_date`, so the ARM64 variant is verified on any host.
 - `div_86400_exact_over_reachable_range`: both sides of every day boundary in
   the reachable `pos_sec` range.
 - `to_datetime_fused_matches_unfused`: extremes, every second around midnight

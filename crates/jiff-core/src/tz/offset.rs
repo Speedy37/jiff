@@ -242,7 +242,11 @@ impl Offset {
             let shift = if bump { 191360 } else { 977792 }; // month offset
             let n = (yrs % 4) * 512 + shift - ypt;
             let d = (((n % 65536) as u128 * C3 as u128) >> 64) as u64; // / 2140
-            (yrs.wrapping_add(bump as u64) as i16, (n / 65536) as i8, (d + 1) as i8)
+            (
+                yrs.wrapping_add(bump as u64) as i16,
+                (n / 65536) as i8,
+                (d + 1) as i8,
+            )
         };
         // Same algorithm with a small era shift so that every product fits
         // in a u64 and every constant in 31 bits (`imul` with immediates).
@@ -268,7 +272,11 @@ impl Offset {
             let shift = if bump { 191360 } else { 977792 };
             let n = (yrs % 4) * 512 + shift - ypt;
             let d = ((n % 65536) * C3) >> S3;
-            (yrs.wrapping_add(bump as u64) as i16, (n / 65536) as i8, (d + 1) as i8)
+            (
+                yrs.wrapping_add(bump as u64) as i16,
+                (n / 65536) as i8,
+                (d + 1) as i8,
+            )
         };
 
         // ---- Time ----
@@ -964,9 +972,11 @@ mod tests {
         use super::div_86400;
         // The reachable `pos_sec` range in `to_datetime`, with a margin.
         const SEC_SHIFT: i64 = 30 * 146097 * 86_400;
-        let lo = Timestamp::MIN.as_second() - 1 + Offset::MIN.seconds() as i64
+        let lo = Timestamp::MIN.as_second() - 1
+            + Offset::MIN.seconds() as i64
             + SEC_SHIFT;
-        let hi = Timestamp::MAX.as_second() + Offset::MAX.seconds() as i64
+        let hi = Timestamp::MAX.as_second()
+            + Offset::MAX.seconds() as i64
             + SEC_SHIFT;
         assert!(lo > 0);
         let (lo, hi) = (lo as u64, hi as u64);
@@ -994,7 +1004,8 @@ mod tests {
                 offset.seconds(),
             );
         };
-        let (smin, smax) = (Timestamp::MIN.as_second(), Timestamp::MAX.as_second());
+        let (smin, smax) =
+            (Timestamp::MIN.as_second(), Timestamp::MAX.as_second());
         let (omin, omax) = (Offset::MIN.seconds(), Offset::MAX.seconds());
 
         // Extremes.

@@ -929,8 +929,52 @@ impl UnixEpochDay {
         return self.to_date_neri_schneider();
         #[cfg(jiff_date = "fast128")]
         return self.to_date_fast128();
-        #[cfg(not(any(jiff_date = "neri", jiff_date = "fast128")))]
+        #[cfg(jiff_date = "fast128arm")]
+        return self.to_date_fast128_arm();
+        #[cfg(not(any(
+            jiff_date = "neri",
+            jiff_date = "fast128",
+            jiff_date = "fast128arm"
+        )))]
         return self.to_date_fast64();
+    }
+
+    /// EXPERIMENT: fast-date-64's ARM64 variant (the article's `SCALE = 1`).
+    ///
+    /// Same algorithm as [`UnixEpochDay::to_date_fast128`], but the year-part
+    /// constants are scaled down by 32 so they fit 16-bit immediates (one
+    /// `mov` instead of a `mov`/`movk` chain on ARM64), and January/February
+    /// is corrected after the fact from the month (`M > 12`) instead of by
+    /// choosing between two shifts on the year-part. Not benchmarked on an
+    /// ARM64 machine yet.
+    ///
+    /// Ref: <https://www.benjoffe.com/fast-date-64>
+    #[inline]
+    #[allow(non_snake_case, dead_code)]
+    const fn to_date_fast128_arm(self) -> Date {
+        const ERAS: u64 = 4726498270;
+        const D_SHIFT: u64 = 146097 * ERAS - 719469;
+        const Y_SHIFT: u64 = 400 * ERAS - 1;
+        const C1: u64 = 505054698555331; // floor(2^64 * 4 / 146097)
+        const C2: u64 = 50504432782230121; // ceil(2^64 * 4 / 1461)
+        const C3: u64 = 8619973866219416 * 32; // floor(2^64 / 2140) * 32
+        const fn mulhi(a: u64, b: u64) -> u64 {
+            ((a as u128 * b as u128) >> 64) as u64
+        }
+        let rev = D_SHIFT.wrapping_sub(self.day as i64 as u64);
+        let cen = mulhi(rev, C1);
+        let jul = rev + cen - cen / 4;
+        let num = jul as u128 * C2 as u128;
+        let yrs = Y_SHIFT.wrapping_sub((num >> 64) as u64);
+        let ypt = mulhi(24451, num as u64); // year-part (backwards), / 32
+        let N = (yrs % 4) * 16 + 30556 - ypt;
+        let D = mulhi(N % 2048, C3); // divide by 2140 / 32
+        let M = N / 2048;
+        let bump = M > 12; // January or February
+        let year = yrs.wrapping_add(bump as u64) as i16;
+        let month = (if bump { M - 12 } else { M }) as i8;
+        let day = (D + 1) as i8;
+        Date { year, month, day }
     }
 
     /// EXPERIMENT: reference fast-date-64 with 64x64->128 multiplies.
@@ -1523,6 +1567,22 @@ mod tests {
 
     fn week_date(year: i16, week: i8, weekday: Weekday) -> ISOWeekDate {
         ISOWeekDate::new(year, week, weekday).unwrap()
+    }
+
+    /// Every `to_date` variant, whichever one `jiff_date` selects.
+    #[test]
+    fn unix_epoch_day_to_date_variants_exhaustive() {
+        for day in UnixEpochDay::MIN.day()..=UnixEpochDay::MAX.day() {
+            let epoch_day = UnixEpochDay::new(day).unwrap();
+            let expected = epoch_day.to_date_neri_schneider();
+            assert_eq!(epoch_day.to_date_fast128(), expected, "fast128 {day}");
+            assert_eq!(
+                epoch_day.to_date_fast128_arm(),
+                expected,
+                "fast128_arm {day}",
+            );
+            assert_eq!(epoch_day.to_date_fast64(), expected, "fast64 {day}");
+        }
     }
 
     #[test]
