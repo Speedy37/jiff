@@ -16,7 +16,8 @@ Background reading:
 
 Best variant: Ben Joffe's fast 64-bit date algorithm in `UnixEpochDay::to_date`,
 Consroe's single-multiply hour/minute in `TimeSecond::to_time`, `÷ 86400` as one
-`imul`, and no range checks in `to_datetime`:
+`imul`, and no range checks in `to_datetime` (keeping them costs about 2%, see
+Findings):
 
 ```sh
 RUSTFLAGS='--cfg jiff_date="fast128" --cfg jiff_time="consroe"' cargo bench -- conversion_random/
@@ -82,9 +83,16 @@ PR #640 exactly is
   `pos_sec < 2^40`) gains about 2% throughput and 5% latency, unfused.
 - Fused `to_datetime` has the best latency (8.7–9.1 ns) but 10% worse
   throughput than unfused; no fused variant (incl. `direct`) closed that gap.
-- With range checks removed, LLVM compiles the unfused best variant into one
-  branch-free sequence of 48 instructions with 7 multiplies (PR #640: 59 and
-  11), folding `DAY_SHIFT` into the date constant on its own.
+- LLVM inlines the unfused best variant and folds `DAY_SHIFT` into the date
+  constant on its own, with or without the range checks. Without them the
+  function is one branch-free sequence: 65 instructions, 48 of them on the
+  dependency path with 7 multiplies (PR #640: 59 and 11).
+- The range checks cost the best variant little. Keeping them
+  (`--cfg jiff_checked`) adds three predictable compare-and-branch pairs and
+  about 16 hot-path instructions, and measures about 2% slower in throughput
+  (4.69–4.83 vs 4.64–4.70 ns) and latency (9.58–9.64 vs 9.39–9.45 ns). Only the
+  per-element `/jiff` loop shows a large gap (6.54–6.72 vs 5.34–5.41 ns, +22%),
+  and that loop is sensitive to code layout.
 
 ## Correctness
 
