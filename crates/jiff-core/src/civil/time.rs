@@ -152,6 +152,19 @@ impl Time {
         Ok(Time { subsec_nanosecond, ..self })
     }
 
+    /// Like [`Time::with_subsec_nanosecond`], but the caller guarantees
+    /// that `subsec_nanosecond` is in range (checked in debug builds only).
+    #[inline]
+    pub(crate) const fn with_subsec_nanosecond_unchecked(
+        self,
+        subsec_nanosecond: i32,
+    ) -> Time {
+        debug_assert!(
+            0 <= subsec_nanosecond && subsec_nanosecond <= 999_999_999
+        );
+        Time { subsec_nanosecond, ..self }
+    }
+
     /// Converts this civil time to a second value corresponding to the number
     /// of seconds that has elapsed since midnight until this time. If this
     /// time is midnight, then the second value returned is `0`.
@@ -312,6 +325,14 @@ impl TimeSecond {
         Ok(TimeSecond { second })
     }
 
+    /// Like [`TimeSecond::new`], but the caller guarantees that `second` is
+    /// in range (checked in debug builds only).
+    #[inline]
+    pub(crate) const fn new_unchecked(second: i32) -> TimeSecond {
+        debug_assert!(0 <= second && second < 86_400);
+        TimeSecond { second }
+    }
+
     /// Creates a new civil time from a given second value.
     ///
     /// This panics when `second` exceeds the maximum number of seconds in a
@@ -359,19 +380,39 @@ impl TimeSecond {
     /// components of a civil time.
     ///
     /// The subsecond component on the `Time` returned is always `0`.
+    ///
+    /// Uses a non-obvious sequence to allow component extraction
+    /// to have overlapping execution.
+    ///
+    /// Calculation of `minute` and `second` use an optimised
+    /// "power-complement-padding" technique instead of standard mod.
+    /// Relies on the identity: 60 + 2^2 = 2^6.
+    ///
+    /// Ref: https://www.benjoffe.com/fast-time-of-day
     #[inline]
     pub const fn to_time(&self) -> Time {
-        let mut second = self.second as u32;
-        let mut time = Time::MIN;
-        if second != 0 {
-            time.hour = (second / 3600) as i8;
-            second %= 3600;
-            if second != 0 {
-                time.minute = (second / 60) as i8;
-                time.second = (second % 60) as i8;
-            }
+        // One 64x64->128 multiply gives both quotients: the high half is
+        // `t / 3600`, and bits 25.. of the low half are `t / 60`. Only the
+        // low 6 bits of `t / 60` are used below, so the hour product that
+        // spills into its upper bits doesn't matter. Exact for t < 1198379.
+        //
+        // Ref: <https://aconz2.github.io/2026/09/09/muldiv.html>
+        const MUL_H: u64 = (1 << 32) / 3600 + 1;
+        const MUL_M: u64 = (1 << 25) / 60 + 1;
+        const MUL: u64 = (MUL_H << 32) + MUL_M;
+        debug_assert!(0 <= self.second && self.second < 86_400);
+
+        let secs: u64 = self.second as u32 as u64;
+        let prd: u128 = secs as u128 * MUL as u128;
+        let hour: u64 = (prd >> 64) as u64;
+        let tmin: u64 = (prd as u64) >> 25;
+
+        Time {
+            hour: hour as i8,
+            minute: ((tmin + 4 * hour) % 64) as i8,
+            second: ((secs + 4 * tmin) % 64) as i8,
+            subsec_nanosecond: 0,
         }
-        time
     }
 }
 
@@ -435,21 +476,13 @@ impl TimeNanosecond {
     /// The subsecond component on the `Time` returned is always `0`.
     #[inline]
     pub const fn to_time(&self) -> Time {
-        let mut nanosecond = self.nanosecond as u64;
-        let mut time = Time::MIN;
-        if nanosecond != 0 {
-            time.hour = (nanosecond / 3_600_000_000_000) as i8;
-            nanosecond %= 3_600_000_000_000;
-            if nanosecond != 0 {
-                time.minute = (nanosecond / 60_000_000_000) as i8;
-                nanosecond %= 60_000_000_000;
-                if nanosecond != 0 {
-                    time.second = (nanosecond / 1_000_000_000) as i8;
-                    time.subsec_nanosecond =
-                        (nanosecond % 1_000_000_000) as i32;
-                }
-            }
-        }
+        // Nanosecond is enforced as non-negative elsewhere
+        // as such, we can cast to unsigned for faster division:
+        let nanos: u64 = self.nanosecond as u64;
+
+        let mut time: Time =
+            TimeSecond { second: (nanos / 1_000_000_000) as i32 }.to_time();
+        time.subsec_nanosecond = (nanos % 1_000_000_000) as i32;
         time
     }
 }

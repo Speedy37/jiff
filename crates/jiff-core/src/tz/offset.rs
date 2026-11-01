@@ -174,43 +174,23 @@ impl Offset {
         const DAY_SHIFT: i32 = 30 * 146097;
         const SEC_SHIFT: i64 = (DAY_SHIFT as i64) * 86_400;
 
-        let pos_sec = (second + (offset.seconds() as i64) + SEC_SHIFT) as u64;
-        let mut epoch_day = (pos_sec / 86_400) as i32;
-        let mut second = (pos_sec % 86_400) as i32;
+        let mut pos_sec =
+            (second + (offset.seconds() as i64) + SEC_SHIFT) as u64;
 
-        if nanosecond < 0 {
-            if second > 0 {
-                second -= 1;
-                nanosecond += 1_000_000_000;
-            } else {
-                epoch_day -= 1;
-                second += 86_399;
-                nanosecond += 1_000_000_000;
-            }
-        }
+        let is_neg_nano: bool = nanosecond < 0;
+        pos_sec -= is_neg_nano as u64;
+        nanosecond += if is_neg_nano { 1_000_000_000 } else { 0 };
 
-        epoch_day -= DAY_SHIFT;
+        let epoch_day = (pos_sec / 86_400) as i32 - DAY_SHIFT;
+        let second = (pos_sec % 86_400) as i32;
 
-        // We should check whether having unchecked APIs
-        // would be beneficial here. In particular, the
-        // math above, coupled with the ranges allowed on
-        // `Timestamp` and `Offset` (by design) guarantee
-        // that our resulting datetime will always be in
-        // range.
-        let date = unwrapr!(
-            civil::UnixEpochDay::new(epoch_day),
-            "always valid Unix epoch day",
-        )
-        .to_date();
-        let time = unwrapr!(
-            unwrapr!(
-                civil::TimeSecond::new(second),
-                "always valid civil second time"
-            )
+        // The math above, coupled with the ranges allowed on `Timestamp` and
+        // `Offset` (by design) guarantee that our resulting datetime will
+        // always be in range, so skip the (never failing) range checks.
+        let date = civil::UnixEpochDay::new_unchecked(epoch_day).to_date();
+        let time = civil::TimeSecond::new_unchecked(second)
             .to_time()
-            .with_subsec_nanosecond(nanosecond),
-            "always valid civil subsecond"
-        );
+            .with_subsec_nanosecond_unchecked(nanosecond);
         civil::DateTime::from_parts(date, time)
     }
 

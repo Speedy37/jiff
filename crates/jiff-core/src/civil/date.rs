@@ -722,6 +722,16 @@ impl UnixEpochDay {
         Ok(UnixEpochDay { day })
     }
 
+    /// Like [`UnixEpochDay::new`], but the caller guarantees that `day` is
+    /// in range (checked in debug builds only).
+    #[inline]
+    pub(crate) const fn new_unchecked(day: i32) -> UnixEpochDay {
+        debug_assert!(
+            UnixEpochDay::MIN.day <= day && day <= UnixEpochDay::MAX.day
+        );
+        UnixEpochDay { day }
+    }
+
     /// Returns the underlying day value.
     ///
     /// This is guaranteed to be in the [`UnixEpochDays`](b::UnixEpochDays)
@@ -900,8 +910,57 @@ impl UnixEpochDay {
 
     /// Converts this Unix epoch day to a Gregorian date.
     #[inline]
-    #[allow(non_upper_case_globals, non_snake_case)] // to mimic source
+    #[allow(non_snake_case)] // to mimic source
     pub const fn to_date(self) -> Date {
+        // Ben Joffe's 64-bit date algorithm: 4 multiplications, no divisions
+        // and no unpredictable branches (`bump` compiles to a cmov).
+        //
+        // Years are counted backwards from a far-future epoch so that leap
+        // years and long centuries line up with it, and the day-of-year step
+        // is skipped by working on a "year-part" that is corrected for the
+        // 1/4 day per year drift with `(yrs % 4) * 512`.
+        //
+        // Ref: <https://www.benjoffe.com/fast-date-64>
+        const ERAS: u64 = 4726498270;
+        const D_SHIFT: u64 = 146097 * ERAS - 719469;
+        const Y_SHIFT: u64 = 400 * ERAS - 1;
+        const C1: u64 = 505054698555331; // floor(2^64 * 4 / 146097)
+        const C2: u64 = 50504432782230121; // ceil(2^64 * 4 / 1461)
+        const C3: u64 = 8619973866219416; // floor(2^64 / 2140)
+
+        const fn mulhi(a: u64, b: u64) -> u64 {
+            ((a as u128 * b as u128) >> 64) as u64
+        }
+
+        // Adjust for the 100/400 leap year rule.
+        let rev = D_SHIFT.wrapping_sub(self.day as i64 as u64); // reverse day count
+        let cen = mulhi(rev, C1); // divide by 36524.25
+        let jul = rev + cen - cen / 4; // Julian map
+
+        // Determine year and year-part.
+        let num = jul as u128 * C2 as u128; // divide by 365.25
+        let yrs = Y_SHIFT.wrapping_sub((num >> 64) as u64); // forward year
+        let ypt = mulhi(782432, num as u64); // year-part (backwards)
+
+        let bump = ypt < 126464; // January or February
+        let shift = if bump { 191360 } else { 977792 }; // month offset
+
+        // Year-modulo-bitshift for leap years, also reverting to the forward
+        // direction.
+        let N = (yrs % 4) * 512 + shift - ypt;
+        let D = mulhi(N % 65536, C3); // divide by 2140
+
+        let year = yrs.wrapping_add(bump as u64) as i16;
+        let month = (N / 65536) as i8;
+        let day = (D + 1) as i8;
+        Date { year, month, day }
+    }
+
+    /// The previous Neri-Schneider implementation of [`UnixEpochDay::to_date`],
+    /// kept as a reference to test the current one against.
+    #[cfg(test)]
+    #[allow(non_upper_case_globals, non_snake_case)] // to mimic source
+    const fn to_date_neri_schneider(self) -> Date {
         // This is Neri-Schneider. There's no branching or divisions.
         //
         // Ref: <https://github.com/cassioneri/eaf/blob/684d3cc32d14eee371d0abe4f683d6d6a49ed5c1/algorithms/neri_schneider.hpp#L40C3-L40C34>
@@ -1403,6 +1462,18 @@ mod tests {
 
     fn week_date(year: i16, week: i8, weekday: Weekday) -> ISOWeekDate {
         ISOWeekDate::new(year, week, weekday).unwrap()
+    }
+
+    #[test]
+    fn unix_epoch_day_to_date_exhaustive() {
+        for day in UnixEpochDay::MIN.day()..=UnixEpochDay::MAX.day() {
+            let epoch_day = UnixEpochDay::new(day).unwrap();
+            assert_eq!(
+                epoch_day.to_date(),
+                epoch_day.to_date_neri_schneider(),
+                "epoch day {day}",
+            );
+        }
     }
 
     #[test]
