@@ -136,6 +136,29 @@ Criterion reports it (one run converts 65,536 timestamps):
 | subsec1970 | 374 | 380 | 303 | -19% | 743 | 672 | 623 | -16% |
 | subsec2000 | 315 | 374 | 300 | -4% | 643 | 656 | 599 | -7% |
 
+To reproduce, from the repository root on this branch:
+
+```sh
+# master: a separate worktree with this branch's benchmark file
+git worktree add ../jiff-master 9ea4c2b
+git show to-datetime-research:bench/src/timestamp.rs \
+  > ../jiff-master/bench/src/timestamp.rs
+(cd ../jiff-master/bench && taskset -c 2 cargo bench -- 'conversion_random/')
+
+# PR #640 and best, from this branch
+cd bench
+RUSTFLAGS='--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_checked --cfg jiff_div128' \
+  taskset -c 2 cargo bench -- 'conversion_random/'
+RUSTFLAGS='--cfg jiff_date="fast128" --cfg jiff_time="consroe"' \
+  taskset -c 2 cargo bench -- 'conversion_random/'
+
+# afterwards
+git worktree remove --force ../jiff-master
+```
+
+Throughput and latency are the `…/jiff-throughput` and `…/jiff-latency`
+results; `taskset -c 2` pins to one core (any idle core will do).
+
 - #640 on its own is slower than `master` in throughput on typical inputs
   (372 vs 316 µs per run on `uniform`) and about even in latency. It only wins where
   `master`'s branches mispredict: `split` and `subsec1970`.
