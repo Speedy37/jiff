@@ -70,6 +70,50 @@ and `jiff_time` selects `v3`, `direct` (h/m/s straight from `pos_sec` using
 PR #640 exactly is
 `--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_checked --cfg jiff_div128`.
 
+## Benched variants
+
+Every variant measured during this research, with the flags that rebuild it.
+Run one like this (each flag set gets its own build in `target/`, so
+alternating between variants doesn't recompile):
+
+```sh
+cd bench
+RUSTFLAGS='--cfg jiff_date="fast128" --cfg jiff_time="consroe"' \
+  taskset -c 2 cargo bench -- 'conversion_random/(uniform|split|subsec1970)/jiff-'
+```
+
+Results are `uniform` in ns per conversion, throughput / latency loops.
+Compare only within a session: the same build drifted up to about 4% between
+sessions. Sessions A–C ran before `div_86400` existed, so their variants
+include `--cfg jiff_div128` to reproduce what was measured.
+
+| variant | `RUSTFLAGS` | session | throughput | latency |
+|---------|-------------|:-------:|-----------:|--------:|
+| PR #640 | `--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_checked --cfg jiff_div128` | A | 6.28 | 10.16 |
+| neri + v3, unchecked | `--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_div128` | A | 6.48 | 10.24 |
+| neri + consroe | `--cfg jiff_date="neri" --cfg jiff_time="consroe" --cfg jiff_div128` | A | 5.04 | 9.82 |
+| fast128 + v3 | `--cfg jiff_date="fast128" --cfg jiff_time="v3" --cfg jiff_div128` | A | 4.87 | 9.79 |
+| fast128 + consroe | `--cfg jiff_date="fast128" --cfg jiff_time="consroe" --cfg jiff_div128` | A | 4.76 | 9.67 |
+| fast64 + v3 | `--cfg jiff_div128` | A | 5.42 | 9.74 |
+| fast64 + consroe | `--cfg jiff_time="consroe" --cfg jiff_div128` | A | 5.07 | 9.43 |
+| fused fast128 + consroe | `--cfg jiff_fused --cfg jiff_div128` | B | 5.21 | 8.91 |
+| fused fast64 + consroe | `--cfg jiff_fused --cfg jiff_date="fast64" --cfg jiff_div128` | B | 5.29 | 8.94 |
+| fused fast128 + v3 | `--cfg jiff_fused --cfg jiff_time="v3" --cfg jiff_div128` | B | 5.57 | 8.82 |
+| fused fast64 + v3 | `--cfg jiff_fused --cfg jiff_date="fast64" --cfg jiff_time="v3" --cfg jiff_div128` | B | 5.56 | 8.94 |
+| fast128 + consroe, old ÷ 86400 | `--cfg jiff_date="fast128" --cfg jiff_time="consroe" --cfg jiff_div128` | C | 4.79 | 10.01 |
+| fast128 + consroe, `div_86400` | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | C | 4.65 | 9.17 |
+| fused, old ÷ 86400 | `--cfg jiff_fused --cfg jiff_div128` | C | 5.19 | 9.04 |
+| fused, `div_86400` | `--cfg jiff_fused` | C | 5.27 | 8.77 |
+| fused fast128 + direct | `--cfg jiff_fused --cfg jiff_time="direct"` | D | 5.03 | 9.23 |
+| fused fast64 + direct | `--cfg jiff_fused --cfg jiff_date="fast64" --cfg jiff_time="direct"` | D | 5.27 | 8.34 |
+| PR #640 | `--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_checked --cfg jiff_div128` | E | 5.46 | 10.48 |
+| **best** | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | E | **4.72** | **9.43** |
+| best, unchecked | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | F | 4.67 | 9.39 |
+| best, checked | `--cfg jiff_date="fast128" --cfg jiff_time="consroe" --cfg jiff_checked` | F | 4.76 | 9.63 |
+
+Session D was noisier than the others (about ±8% between input kinds of the
+same build), so its fused rows are only roughly comparable with C.
+
 ## Findings
 
 - Throughput is ALU-bound (about 80 ALU uops per conversion, 4 ALUs), so
