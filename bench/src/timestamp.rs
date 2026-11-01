@@ -404,6 +404,43 @@ fn random_offset_conversion_benchmark(
                 }
             })
         });
+        // Throughput: independent conversions written into an output
+        // array, with one `bb` per pass. Unlike the loop above, nothing is
+        // forced through a stack slot per element, so iterations can
+        // overlap freely, as they would in real code that stores results.
+        let mut out = vec![civil::DateTime::default(); count];
+        benchmark(c, format!("{name}/jiff-throughput"), |b| {
+            b.iter(|| {
+                let offset = bb(offset);
+                for (o, &stamp) in out.iter_mut().zip(bb(&timestamps)) {
+                    *o = offset.to_datetime(stamp);
+                }
+                bb(&mut out);
+            })
+        });
+        // Latency: a serial dependency chain. Each result picks the index
+        // of the next input through a value the compiler can't see is zero,
+        // so the inputs are unchanged but each conversion must wait for the
+        // previous one (plus a constant AND and L1 load per step).
+        benchmark(c, format!("{name}/jiff-latency"), |b| {
+            b.iter(|| {
+                let offset = bb(offset);
+                let zero = bb(0usize);
+                let mut carry = 0usize;
+                for i in 0..timestamps.len() {
+                    let stamp = timestamps[i ^ (carry & zero)];
+                    let dt = offset.to_datetime(stamp);
+                    carry = (dt.year() as usize)
+                        ^ (dt.month() as usize)
+                        ^ (dt.day() as usize)
+                        ^ (dt.hour() as usize)
+                        ^ (dt.minute() as usize)
+                        ^ (dt.second() as usize)
+                        ^ (dt.subsec_nanosecond() as usize);
+                }
+                bb(carry);
+            })
+        });
     }
 }
 
