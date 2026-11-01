@@ -123,18 +123,19 @@ same build), so its fused rows are only roughly comparable with C.
 
 Session G: upstream `master` (`9ea4c2b`, without #640) built in a separate
 worktree with this branch's `bench/src/timestamp.rs`, then PR #640 and best
-from this branch, one after another on the same core. µs per run, as
-Criterion reports it (one run converts 65,536 timestamps):
+from this branch, one after another on the same core. Each cell is µs per
+run, as Criterion reports it (one run converts 65,536 timestamps), with ns
+per conversion in parentheses:
 
 | input | throughput master | PR #640 | best | best vs master | latency master | PR #640 | best | best vs master |
 |-------|------:|------:|------:|------:|------:|------:|------:|------:|
-| uniform | 316 | 372 | 304 | -4% | 638 | 657 | 616 | -4% |
-| secs-zero | 319 | 374 | 309 | -3% | 649 | 657 | 611 | -6% |
-| zero-min-secs | 285 | 373 | 304 | +7% | 621 | 658 | 610 | -2% |
-| all-same | 316 | 375 | 305 | -3% | 645 | 658 | 619 | -4% |
-| split | 477 | 376 | 304 | -36% | 801 | 661 | 599 | -25% |
-| subsec1970 | 374 | 380 | 303 | -19% | 743 | 672 | 623 | -16% |
-| subsec2000 | 315 | 374 | 300 | -4% | 643 | 656 | 599 | -7% |
+| uniform | 316 (4.82) | 372 (5.68) | 304 (4.64) | -4% | 638 (9.74) | 657 (10.02) | 616 (9.39) | -4% |
+| secs-zero | 319 (4.86) | 374 (5.71) | 309 (4.72) | -3% | 649 (9.91) | 657 (10.03) | 611 (9.32) | -6% |
+| zero-min-secs | 285 (4.35) | 373 (5.69) | 304 (4.63) | +7% | 621 (9.48) | 658 (10.04) | 610 (9.30) | -2% |
+| all-same | 316 (4.82) | 375 (5.73) | 305 (4.65) | -3% | 645 (9.84) | 658 (10.04) | 619 (9.44) | -4% |
+| split | 477 (7.28) | 376 (5.74) | 304 (4.64) | -36% | 801 (12.22) | 661 (10.09) | 599 (9.13) | -25% |
+| subsec1970 | 374 (5.71) | 380 (5.80) | 303 (4.62) | -19% | 743 (11.34) | 672 (10.26) | 623 (9.51) | -16% |
+| subsec2000 | 315 (4.80) | 374 (5.71) | 300 (4.58) | -4% | 643 (9.81) | 656 (10.01) | 599 (9.14) | -7% |
 
 To reproduce, from the repository root on this branch:
 
@@ -160,7 +161,7 @@ Throughput and latency are the `…/jiff-throughput` and `…/jiff-latency`
 results; `taskset -c 2` pins to one core (any idle core will do).
 
 - #640 on its own is slower than `master` in throughput on typical inputs
-  (372 vs 316 µs per run on `uniform`) and about even in latency. It only wins where
+  (372 vs 316 µs per run, 5.68 vs 4.82 ns per conversion, on `uniform`) and about even in latency. It only wins where
   `master`'s branches mispredict: `split` and `subsec1970`.
 - Best against `master`: 3–4% faster in throughput and 2–7% in latency on
   typical inputs, 36% / 25% faster on `split` and 19% / 16% on `subsec1970`,
