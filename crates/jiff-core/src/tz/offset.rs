@@ -12,6 +12,28 @@ pub struct Offset {
     seconds: i32,
 }
 
+/// `pos_sec / 86_400` for the shifted, always-positive second counts used by
+/// `Offset::to_datetime`.
+///
+/// Those are below 2^40 (at most ~6.32e11), so with `86_400 = 2^7 * 675` the
+/// division is `(pos_sec >> 7) / 675`, done as a 64-bit multiply-shift by
+/// `m = ceil(2^41 / 675)`. With `e = m * 675 - 2^41 = 373`, the result is
+/// exact whenever `(pos_sec >> 7) * e < 2^41`, i.e. `pos_sec >> 7 < 5.89e9`,
+/// and the product stays below 2^64. Unlike `pos_sec / 86_400`, which
+/// compiles to a 64x64->128 `mul` on x86-64 (pinning `rax:rdx`), this is a
+/// plain `imul`.
+#[inline(always)]
+const fn div_86400(pos_sec: u64) -> u64 {
+    #[cfg(jiff_div128)]
+    return pos_sec / 86_400;
+    #[cfg(not(jiff_div128))]
+    {
+        const M: u64 = (1 << 41) / 675 + 1;
+        debug_assert!((pos_sec >> 7) < (1 << 41) / (M * 675 - (1 << 41)));
+        ((pos_sec >> 7) * M) >> 41
+    }
+}
+
 impl Offset {
     /// The minimum possible offset from UTC.
     pub const MIN: Offset = Offset { seconds: b::OffsetTotalSeconds::MIN };
@@ -162,6 +184,150 @@ impl Offset {
     /// add to this timestamp to get the local time.
     #[inline]
     pub const fn to_datetime(self, timestamp: Timestamp) -> civil::DateTime {
+        #[cfg(jiff_fused)]
+        return self.to_datetime_fused(timestamp);
+        #[cfg(not(jiff_fused))]
+        return self.to_datetime_unfused(timestamp);
+    }
+
+    /// EXPERIMENT: `to_datetime` as one fused computation on the shifted,
+    /// always-positive second count, with no intermediate `UnixEpochDay` /
+    /// `TimeSecond` values, no `i32` round trips and no range checks.
+    ///
+    /// Date: Ben Joffe's fast 64-bit date algorithm
+    /// (<https://www.benjoffe.com/fast-date-64>), with the day shift folded
+    /// into its reverse-day constant.
+    ///
+    /// Time: one 64x64->128 multiply yields both `t / 3600` (high half) and
+    /// the low 6 bits of `t / 60` (low half), then the `60 + 4 = 64` trick
+    /// gives minute and second (<https://www.benjoffe.com/fast-time-of-day>,
+    /// after Andrew Consroe's <https://aconz2.github.io/2026/09/09/muldiv.html>).
+    #[inline]
+    #[allow(dead_code)]
+    const fn to_datetime_fused(self, timestamp: Timestamp) -> civil::DateTime {
+        // Shift into the positive domain so that division and remainder can
+        // use unsigned math. 30 * 400 years covers [-9,999..1970].
+        const DAY_SHIFT: u64 = 30 * 146097;
+        const SEC_SHIFT: i64 = (DAY_SHIFT as i64) * 86_400;
+
+        let mut nanosecond = timestamp.subsec_nanosecond();
+        let is_neg_nano = nanosecond < 0;
+        nanosecond += if is_neg_nano { 1_000_000_000 } else { 0 };
+        let pos_sec = (timestamp.as_second()
+            + (self.seconds() as i64)
+            + SEC_SHIFT) as u64
+            - (is_neg_nano as u64);
+
+        let pos_day = div_86400(pos_sec);
+        let sod = pos_sec - pos_day * 86_400; // second of day, < 86_400
+
+        // ---- Date ----
+        // `rev = D_SHIFT - unix_day` and `unix_day = pos_day - DAY_SHIFT`, so
+        // the day shift folds into the reverse-day constant.
+        #[cfg(not(jiff_date = "fast64"))]
+        let (year, month, day) = {
+            const ERAS: u64 = 4726498270;
+            const D_SHIFT: u64 = 146097 * ERAS - 719469 + DAY_SHIFT;
+            const Y_SHIFT: u64 = 400 * ERAS - 1;
+            const C1: u64 = 505054698555331; // floor(2^64 * 4 / 146097)
+            const C2: u64 = 50504432782230121; // ceil(2^64 * 4 / 1461)
+            const C3: u64 = 8619973866219416; // floor(2^64 / 2140)
+            let rev = D_SHIFT - pos_day; // reverse day count
+            let cen = ((rev as u128 * C1 as u128) >> 64) as u64; // / 36524.25
+            let jul = rev + cen - cen / 4; // Julian map
+            let num = jul as u128 * C2 as u128; // / 365.25
+            let yrs = Y_SHIFT.wrapping_sub((num >> 64) as u64); // forward year
+            let ypt = ((782432 * (num as u64 as u128)) >> 64) as u64; // year-part
+            let bump = ypt < 126464; // January or February
+            let shift = if bump { 191360 } else { 977792 }; // month offset
+            let n = (yrs % 4) * 512 + shift - ypt;
+            let d = (((n % 65536) as u128 * C3 as u128) >> 64) as u64; // / 2140
+            (yrs.wrapping_add(bump as u64) as i16, (n / 65536) as i8, (d + 1) as i8)
+        };
+        // Same algorithm with a small era shift so that every product fits
+        // in a u64 and every constant in 31 bits (`imul` with immediates).
+        // Exhaustively verified, see `UnixEpochDay::to_date_fast64`.
+        #[cfg(jiff_date = "fast64")]
+        let (year, month, day) = {
+            const ERAS: u64 = 32;
+            const D_SHIFT: u64 = 146097 * ERAS - 719469 + DAY_SHIFT;
+            const Y_SHIFT: u64 = 400 * ERAS - 1;
+            const S1: u32 = 40;
+            const S2: u32 = 39;
+            const S3: u32 = 26;
+            const C1: u64 = (1 << S1) * 4 / 146097;
+            const C2: u64 = ((1 << S2) * 4 + 1460) / 1461;
+            const C3: u64 = (1 << S3) / 2140;
+            let rev = D_SHIFT - pos_day;
+            let cen = (rev * C1) >> S1;
+            let jul = rev + cen - cen / 4;
+            let num = jul * C2;
+            let yrs = Y_SHIFT.wrapping_sub(num >> S2);
+            let ypt = ((num & ((1 << S2) - 1)) * 782432) >> S2;
+            let bump = ypt < 126464;
+            let shift = if bump { 191360 } else { 977792 };
+            let n = (yrs % 4) * 512 + shift - ypt;
+            let d = ((n % 65536) * C3) >> S3;
+            (yrs.wrapping_add(bump as u64) as i16, (n / 65536) as i8, (d + 1) as i8)
+        };
+
+        // ---- Time ----
+        // Directly from `pos_sec`, without waiting for `pos_day`/`sod`:
+        // `SEC_SHIFT` is a whole number of days, so with `60 + 4 = 64` and
+        // `24 + 8 = 32`:
+        //   second = (pos_sec + 4 * tmin) % 64,   tmin  = pos_sec / 60
+        //   minute = (tmin + 4 * thour) % 64,     thour = pos_sec / 3600
+        //   hour   = (thour + 8 * pos_day) % 32
+        // `pos_sec < 2^40`, so the two quotients use 64x64->128 `mulhi` by
+        // `ceil(2^64 / d)`, exact far beyond that range.
+        #[cfg(jiff_time = "direct")]
+        let (hour, minute, second) = {
+            const M60: u64 = u64::MAX / 60 + 1;
+            const M3600: u64 = u64::MAX / 3600 + 1;
+            let tmin = ((pos_sec as u128 * M60 as u128) >> 64) as u64;
+            let thour = ((pos_sec as u128 * M3600 as u128) >> 64) as u64;
+            let _ = sod;
+            (
+                (thour + 8 * pos_day) % 32,
+                (tmin + 4 * thour) % 64,
+                (pos_sec + 4 * tmin) % 64,
+            )
+        };
+        #[cfg(not(any(jiff_time = "v3", jiff_time = "direct")))]
+        let (hour, minute, second) = {
+            const MUL_H: u64 = (1 << 32) / 3600 + 1;
+            const MUL_M: u64 = (1 << 25) / 60 + 1;
+            const MUL: u64 = (MUL_H << 32) + MUL_M;
+            let prd = sod as u128 * MUL as u128;
+            let hour = (prd >> 64) as u64;
+            let tmin = (prd as u64) >> 25; // only its low 6 bits matter
+            (hour, (tmin + 4 * hour) % 64, (sod + 4 * tmin) % 64)
+        };
+        // Two independent `imul`s with 31-bit immediates.
+        #[cfg(jiff_time = "v3")]
+        let (hour, minute, second) = {
+            let tmin = (sod * 71582789) >> 32; // = sod / 60
+            let hour = (sod * 1193047) >> 32; // = sod / 3600
+            (hour, (tmin + 4 * hour) % 64, (sod + 4 * tmin) % 64)
+        };
+
+        civil::DateTime::from_parts(
+            civil::Date::from_raw_unchecked(year, month, day),
+            civil::Time::from_raw_unchecked(
+                hour as i8,
+                minute as i8,
+                second as i8,
+                nanosecond,
+            ),
+        )
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) const fn to_datetime_unfused(
+        self,
+        timestamp: Timestamp,
+    ) -> civil::DateTime {
         let offset = self;
         let second = timestamp.as_second();
         let mut nanosecond = timestamp.subsec_nanosecond();
@@ -181,22 +347,29 @@ impl Offset {
         pos_sec -= is_neg_nano as u64;
         nanosecond += if is_neg_nano { 1_000_000_000 } else { 0 };
 
-        let mut epoch_day = (pos_sec / 86_400) as i32;
-        let second = (pos_sec % 86_400) as i32;
+        let pos_day = div_86400(pos_sec);
+        let mut epoch_day = pos_day as i32;
+        let second = (pos_sec - pos_day * 86_400) as i32;
 
         epoch_day -= DAY_SHIFT;
 
-        // We should check whether having unchecked APIs
-        // would be beneficial here. In particular, the
-        // math above, coupled with the ranges allowed on
-        // `Timestamp` and `Offset` (by design) guarantee
-        // that our resulting datetime will always be in
-        // range.
+        // The math above, coupled with the ranges allowed on `Timestamp` and
+        // `Offset` (by design) guarantee that our resulting datetime will
+        // always be in range, so skip the (never failing) range checks.
+        #[cfg(not(jiff_checked))]
+        let date = civil::UnixEpochDay::new_unchecked(epoch_day).to_date();
+        #[cfg(not(jiff_checked))]
+        let time = civil::TimeSecond::new_unchecked(second)
+            .to_time()
+            .with_subsec_nanosecond_unchecked(nanosecond);
+        // EXPERIMENT: the original checked constructors.
+        #[cfg(jiff_checked)]
         let date = unwrapr!(
             civil::UnixEpochDay::new(epoch_day),
             "always valid Unix epoch day",
         )
         .to_date();
+        #[cfg(jiff_checked)]
         let time = unwrapr!(
             unwrapr!(
                 civil::TimeSecond::new(second),
@@ -784,6 +957,82 @@ impl std::error::Error for AmbiguousError {}
 #[cfg(test)]
 mod tests {
     use super::Offset;
+    use crate::Timestamp;
+
+    #[test]
+    fn div_86400_exact_over_reachable_range() {
+        use super::div_86400;
+        // The reachable `pos_sec` range in `to_datetime`, with a margin.
+        const SEC_SHIFT: i64 = 30 * 146097 * 86_400;
+        let lo = Timestamp::MIN.as_second() - 1 + Offset::MIN.seconds() as i64
+            + SEC_SHIFT;
+        let hi = Timestamp::MAX.as_second() + Offset::MAX.seconds() as i64
+            + SEC_SHIFT;
+        assert!(lo > 0);
+        let (lo, hi) = (lo as u64, hi as u64);
+        // Both sides of every day boundary, plus the range ends.
+        for day in lo / 86_400..=hi / 86_400 + 1 {
+            for x in [day * 86_400, day * 86_400 + 86_399] {
+                assert_eq!(div_86400(x), x / 86_400, "x={x}");
+            }
+        }
+        for x in [lo, hi, hi + 86_400] {
+            assert_eq!(div_86400(x), x / 86_400, "x={x}");
+        }
+    }
+
+    #[test]
+    fn to_datetime_fused_matches_unfused() {
+        let checked = core::cell::Cell::new(0u64);
+        let check = |secs: i64, nanos: i32, offset: Offset| {
+            let Ok(ts) = Timestamp::new(secs, nanos) else { return };
+            checked.set(checked.get() + 1);
+            assert_eq!(
+                offset.to_datetime_fused(ts),
+                offset.to_datetime_unfused(ts),
+                "secs={secs} nanos={nanos} offset={}",
+                offset.seconds(),
+            );
+        };
+        let (smin, smax) = (Timestamp::MIN.as_second(), Timestamp::MAX.as_second());
+        let (omin, omax) = (Offset::MIN.seconds(), Offset::MAX.seconds());
+
+        // Extremes.
+        for secs in [smin, smin + 1, -1, 0, 1, smax - 1, smax] {
+            for nanos in [-999_999_999, -1, 0, 1, 999_999_999] {
+                for off in [omin, -1, 0, 1, omax] {
+                    check(secs, nanos, Offset::constant_seconds(off));
+                }
+            }
+        }
+        // Every second around a few hundred local midnights.
+        for day in (-4_000_000i64..3_000_000).step_by(9_973) {
+            for off in [omin, -3600, 0, 19800, omax] {
+                let midnight = day * 86_400 - off as i64;
+                for secs in midnight - 3..=midnight + 3 {
+                    for nanos in [-1, 0, 1] {
+                        check(secs, nanos, Offset::constant_seconds(off));
+                    }
+                }
+            }
+        }
+        // Pseudo-random sample of the full range.
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2_000_000 {
+            let secs = smin + (next() % (smax - smin + 1) as u64) as i64;
+            let nanos = (next() % 1_999_999_999) as i32 - 999_999_999;
+            let off = omin + (next() % (omax - omin + 1) as u64) as i32;
+            check(secs, nanos, Offset::constant_seconds(off));
+        }
+        // Guard against inputs silently being rejected by `Timestamp::new`.
+        assert!(checked.get() > 2_000_000, "only {} checked", checked.get());
+    }
 
     #[test]
     fn checked_subtracts_positive_and_negative_seconds() {

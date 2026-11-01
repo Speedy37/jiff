@@ -137,6 +137,35 @@ impl Time {
         Ok(Time { subsec_nanosecond, ..self })
     }
 
+    /// Like [`Time::with_subsec_nanosecond`], but the caller guarantees
+    /// that `subsec_nanosecond` is in range (checked in debug builds only).
+    #[inline]
+    pub(crate) const fn with_subsec_nanosecond_unchecked(
+        self,
+        subsec_nanosecond: i32,
+    ) -> Time {
+        debug_assert!(0 <= subsec_nanosecond && subsec_nanosecond < 1_000_000_000);
+        Time { subsec_nanosecond, ..self }
+    }
+
+    /// Creates a time from raw fields without any checks. The caller must
+    /// guarantee every field is in range (checked in debug builds).
+    #[inline]
+    pub(crate) const fn from_raw_unchecked(
+        hour: i8,
+        minute: i8,
+        second: i8,
+        subsec_nanosecond: i32,
+    ) -> Time {
+        debug_assert!(0 <= hour && hour <= 23);
+        debug_assert!(0 <= minute && minute <= 59);
+        debug_assert!(0 <= second && second <= 59);
+        debug_assert!(
+            0 <= subsec_nanosecond && subsec_nanosecond <= 999_999_999
+        );
+        Time { hour, minute, second, subsec_nanosecond }
+    }
+
     /// Returns this time with its subsecond component replaced with the
     /// nanosecond component given.
     ///
@@ -312,6 +341,14 @@ impl TimeSecond {
         Ok(TimeSecond { second })
     }
 
+    /// Like [`TimeSecond::new`], but the caller guarantees that `second` is
+    /// in range (checked in debug builds only).
+    #[inline]
+    pub(crate) const fn new_unchecked(second: i32) -> TimeSecond {
+        debug_assert!(0 <= second && second < 86_400);
+        TimeSecond { second }
+    }
+
     /// Creates a new civil time from a given second value.
     ///
     /// This panics when `second` exceeds the maximum number of seconds in a
@@ -370,15 +407,30 @@ impl TimeSecond {
     /// Ref: https://www.benjoffe.com/fast-time-of-day
     #[inline]
     pub const fn to_time(&self) -> Time {
-        // cast to unsigned for faster division:
-        let secs: u32 = self.second as u32;
-        let hour: u32 = (secs / 3600) as u32;
-        let tmin: u32 = (secs / 60) as u32;
+        // Two independent fixed-point multiplies, exact for t < 2257199.
+        // Both constants fit in 31 bits, so on x86-64 each is a single
+        // three-operand `imul` (no 128-bit `mul` clobbering `rax:rdx`).
+        debug_assert!(0 <= self.second && self.second < 128 * 3600);
+
+        let time: u32 = self.second as u32;
+        #[cfg(not(jiff_time = "consroe"))]
+        let (tmin, hour) = (
+            (time as u64 * 71582789 >> 32) as u32, // = time / 60
+            (time as u64 * 1193047 >> 32) as u32,  // = time / 3600
+        );
+        #[cfg(jiff_time = "consroe")]
+        let (tmin, hour) = {
+            const MUL_H: u64 = (1 << 32) / 3600 + 1;
+            const MUL_M: u64 = (1 << 25) / 60 + 1;
+            const MUL: u64 = (MUL_H << 32) + MUL_M;
+            let prd: u128 = time as u128 * MUL as u128;
+            (((prd as u64) >> 25) as u32, (prd >> 64) as u32)
+        };
 
         Time {
             hour: hour as i8,
-            minute: ((tmin + 4 * hour) % 64) as i8,
-            second: ((secs + 4 * tmin) % 64) as i8,
+            minute: (tmin.wrapping_add(hour.wrapping_mul(4)) % 64) as i8,
+            second: (time.wrapping_add(tmin.wrapping_mul(4)) % 64) as i8,
             subsec_nanosecond: 0,
         }
     }

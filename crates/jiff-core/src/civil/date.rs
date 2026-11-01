@@ -68,6 +68,20 @@ impl Date {
     }
     */
 
+    /// Creates a date from raw fields without any checks. The caller must
+    /// guarantee a valid Gregorian date in range (checked in debug builds).
+    #[inline]
+    pub(crate) const fn from_raw_unchecked(
+        year: i16,
+        month: i8,
+        day: i8,
+    ) -> Date {
+        debug_assert!(-9999 <= year && year <= 9999);
+        debug_assert!(1 <= month && month <= 12);
+        debug_assert!(1 <= day && day <= 31);
+        Date { year, month, day }
+    }
+
     /// Creates a new date in the Gregorian calendar.
     ///
     /// If the date is invalid or any of the values are out of their supported
@@ -722,6 +736,16 @@ impl UnixEpochDay {
         Ok(UnixEpochDay { day })
     }
 
+    /// Like [`UnixEpochDay::new`], but the caller guarantees that `day` is
+    /// in range (checked in debug builds only).
+    #[inline]
+    pub(crate) const fn new_unchecked(day: i32) -> UnixEpochDay {
+        debug_assert!(
+            UnixEpochDay::MIN.day <= day && day <= UnixEpochDay::MAX.day
+        );
+        UnixEpochDay { day }
+    }
+
     /// Returns the underlying day value.
     ///
     /// This is guaranteed to be in the [`UnixEpochDays`](b::UnixEpochDays)
@@ -900,8 +924,104 @@ impl UnixEpochDay {
 
     /// Converts this Unix epoch day to a Gregorian date.
     #[inline]
-    #[allow(non_upper_case_globals, non_snake_case)] // to mimic source
     pub const fn to_date(self) -> Date {
+        #[cfg(jiff_date = "neri")]
+        return self.to_date_neri_schneider();
+        #[cfg(jiff_date = "fast128")]
+        return self.to_date_fast128();
+        #[cfg(not(any(jiff_date = "neri", jiff_date = "fast128")))]
+        return self.to_date_fast64();
+    }
+
+    /// EXPERIMENT: reference fast-date-64 with 64x64->128 multiplies.
+    #[inline]
+    #[allow(non_snake_case, dead_code)]
+    const fn to_date_fast128(self) -> Date {
+        const ERAS: u64 = 4726498270;
+        const D_SHIFT: u64 = 146097 * ERAS - 719469;
+        const Y_SHIFT: u64 = 400 * ERAS - 1;
+        const C1: u64 = 505054698555331;
+        const C2: u64 = 50504432782230121;
+        const C3: u64 = 8619973866219416;
+        const fn mulhi(a: u64, b: u64) -> u64 {
+            ((a as u128 * b as u128) >> 64) as u64
+        }
+        let rev = D_SHIFT.wrapping_sub(self.day as i64 as u64);
+        let cen = mulhi(rev, C1);
+        let jul = rev + cen - cen / 4;
+        let num = jul as u128 * C2 as u128;
+        let yrs = Y_SHIFT.wrapping_sub((num >> 64) as u64);
+        let ypt = mulhi(782432, num as u64);
+        let bump = ypt < 126464;
+        let shift = if bump { 191360 } else { 977792 };
+        let N = (yrs % 4) * 512 + shift - ypt;
+        let D = mulhi(N % 65536, C3);
+        let year = yrs.wrapping_add(bump as u64) as i16;
+        let month = (N / 65536) as i8;
+        let day = (D + 1) as i8;
+        Date { year, month, day }
+    }
+
+    #[inline]
+    #[allow(non_snake_case, dead_code)] // to mimic source
+    const fn to_date_fast64(self) -> Date {
+        // Ben Joffe's fast date algorithm: 4 multiplications, no divisions
+        // and no unpredictable branches (`bump` compiles to a cmov).
+        //
+        // Years are counted backwards from a future epoch so that leap years
+        // and long centuries line up with it, and the day-of-year step is
+        // skipped by working on a "year-part" that is corrected for the 1/4
+        // day per year drift with `(yrs % 4) * 512`.
+        //
+        // Ref: <https://www.benjoffe.com/fast-date-64>
+        //
+        // The reference shifts by ~4.7 billion eras to cover the full 64-bit
+        // range, which requires 64x64->128 multiplies. Our range is only
+        // +/- 10,000 years, so we shift by just 32 eras: `rev` then stays
+        // below 2^23 and every product fits in a `u64`, and all constants
+        // fit in 31 bits. On x86-64 this lets every multiply be a
+        // three-operand `imul` instead of a `mul` that clobbers `rax:rdx`.
+        // These parameters are verified exhaustively for every valid
+        // `UnixEpochDay` (see `unix_epoch_day_to_date_exhaustive`).
+        const ERAS: u64 = 32;
+        const D_SHIFT: u64 = 146097 * ERAS - 719469;
+        const Y_SHIFT: u64 = 400 * ERAS - 1;
+        const S1: u32 = 40;
+        const S2: u32 = 39;
+        const S3: u32 = 26;
+        const C1: u64 = (1 << S1) * 4 / 146097; // floor(2^S1 * 4 / 146097)
+        const C2: u64 = ((1 << S2) * 4 + 1460) / 1461; // ceil(2^S2 * 4 / 1461)
+        const C3: u64 = (1 << S3) / 2140; // floor(2^S3 / 2140)
+
+        // Adjust for the 100/400 leap year rule.
+        let rev = D_SHIFT.wrapping_sub(self.day as i64 as u64); // reverse day count
+        let cen = (rev * C1) >> S1; // divide by 36524.25
+        let jul = rev + cen - cen / 4; // Julian map
+
+        // Determine year and year-part.
+        let num = jul * C2; // divide by 365.25
+        let yrs = Y_SHIFT.wrapping_sub(num >> S2); // forward year
+        let ypt = ((num & ((1 << S2) - 1)) * 782432) >> S2; // year-part (backwards)
+
+        let bump = ypt < 126464; // January or February
+        let shift = if bump { 191360 } else { 977792 }; // month offset
+
+        // Year-modulo-bitshift for leap years, also reverting to the forward
+        // direction.
+        let N = (yrs % 4) * 512 + shift - ypt;
+        let D = ((N % 65536) * C3) >> S3; // divide by 2140
+
+        let year = yrs.wrapping_add(bump as u64) as i16;
+        let month = (N / 65536) as i8;
+        let day = (D + 1) as i8;
+        Date { year, month, day }
+    }
+
+    /// The previous Neri-Schneider implementation of [`UnixEpochDay::to_date`],
+    /// kept as a reference to test the current one against.
+    #[allow(non_upper_case_globals, non_snake_case, dead_code)] // to mimic source
+    #[inline]
+    const fn to_date_neri_schneider(self) -> Date {
         // This is Neri-Schneider. There's no branching or divisions.
         //
         // Ref: <https://github.com/cassioneri/eaf/blob/684d3cc32d14eee371d0abe4f683d6d6a49ed5c1/algorithms/neri_schneider.hpp#L40C3-L40C34>
@@ -1403,6 +1523,18 @@ mod tests {
 
     fn week_date(year: i16, week: i8, weekday: Weekday) -> ISOWeekDate {
         ISOWeekDate::new(year, week, weekday).unwrap()
+    }
+
+    #[test]
+    fn unix_epoch_day_to_date_exhaustive() {
+        for day in UnixEpochDay::MIN.day()..=UnixEpochDay::MAX.day() {
+            let epoch_day = UnixEpochDay::new(day).unwrap();
+            assert_eq!(
+                epoch_day.to_date(),
+                epoch_day.to_date_neri_schneider(),
+                "epoch day {day}",
+            );
+        }
     }
 
     #[test]
