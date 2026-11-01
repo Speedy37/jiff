@@ -115,6 +115,8 @@ include `--cfg jiff_div128` to reproduce what was measured.
 | `master` (`9ea4c2b`) | none: build upstream `master` with this branch's `bench/src/timestamp.rs` | G | 4.82 | 9.74 |
 | PR #640 | `--cfg jiff_date="neri" --cfg jiff_time="v3" --cfg jiff_checked --cfg jiff_div128` | G | 5.68 | 10.02 |
 | best | `--cfg jiff_date="fast128" --cfg jiff_time="consroe"` | G | 4.64 | 9.39 |
+| `master` (`9ea4c2b`) | none: build upstream `master` with this branch's `bench/src/timestamp.rs` | H | 4.94 | 9.89 |
+| `to-datetime-fast` (best without `div_86400`) | equivalent: `--cfg jiff_date="fast128" --cfg jiff_time="consroe" --cfg jiff_div128` | H | 5.00 | 9.56 |
 
 Session D was noisier than the others (about ±8% between input kinds of the
 same build), so its fused rows are only roughly comparable with C.
@@ -170,6 +172,51 @@ results; `taskset -c 2` pins to one core (any idle core will do).
 - So most of the "best vs #640" gain recovers what #640's branch-free code
   cost on typical inputs; the gain over `master` is small except on inputs
   that defeat `master`'s branches.
+
+## Clean branch (`to-datetime-fast`) against `master`
+
+`to-datetime-fast` is best without `div_86400`: one commit on `master` with
+fast-date-64, Consroe's `to_time`, the branch-free nanosecond fix-up and no
+range checks, but the plain `pos_sec / 86_400`. On x86-64 it is a branch-free
+sequence of 66 instructions (7 `mul`, 1 `imul`). On this branch the same code
+is `--cfg jiff_date="fast128" --cfg jiff_time="consroe" --cfg jiff_div128`
+(identical instruction sequence, except the second of day is computed with a
+32-bit `imul`/`add` instead of a 64-bit `imul`/`sub`).
+
+Session H: both built in separate worktrees with this branch's
+`bench/src/timestamp.rs`, one after another on the same core. µs per run
+(ns per conversion):
+
+| input | throughput master | to-datetime-fast | vs master | latency master | to-datetime-fast | vs master |
+|-------|------:|------:|------:|------:|------:|------:|
+| uniform | 324 (4.94) | 327 (5.00) | +1% | 648 (9.89) | 626 (9.56) | -3% |
+| secs-zero | 331 (5.05) | 318 (4.86) | -4% | 656 (10.01) | 630 (9.61) | -4% |
+| zero-min-secs | 324 (4.95) | 322 (4.91) | -1% | 613 (9.36) | 643 (9.80) | +5% |
+| all-same | 324 (4.94) | 316 (4.83) | -2% | 658 (10.05) | 631 (9.62) | -4% |
+| split | 491 (7.49) | 321 (4.89) | -35% | 807 (12.32) | 645 (9.84) | -20% |
+| subsec1970 | 367 (5.60) | 315 (4.81) | -14% | 752 (11.47) | 623 (9.51) | -17% |
+| subsec2000 | 324 (4.95) | 319 (4.87) | -2% | 663 (10.12) | 624 (9.53) | -6% |
+
+To reproduce, from the repository root on this branch:
+
+```sh
+for b in master to-datetime-fast; do
+  git worktree add --detach ../jiff-$b $b
+  git show to-datetime-research:bench/src/timestamp.rs \
+    > ../jiff-$b/bench/src/timestamp.rs
+  (cd ../jiff-$b/bench && taskset -c 2 cargo bench -- 'conversion_random/')
+  git worktree remove --force ../jiff-$b
+done
+```
+
+- Typical inputs: about even with `master` in throughput (−4% to +1%) and
+  3–6% better in latency.
+- Inputs that defeat `master`'s branches: 35% / 20% faster on `split` and
+  14% / 17% on `subsec1970`.
+- `zero-min-secs`: about even in throughput this time (session G had
+  `master` 7% ahead there, so that case is noisy) and 5% slower in latency.
+- Dropping `div_86400` costs a few percent on typical inputs (compare
+  session G's best: 3–4% ahead of `master` in throughput).
 
 ## Findings
 
